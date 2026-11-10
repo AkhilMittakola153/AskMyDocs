@@ -1,8 +1,10 @@
 import re
+
 import streamlit as st
 from docx import Document
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
+
 from llm import MODEL, LLMError, chat
 
 CHUNK_WORDS, OVERLAP, TOP_K = 250, 50, 5
@@ -68,10 +70,10 @@ def answer(q, hits):
     system = ("Answer the question using ONLY the sources below. Cite each fact as "
               "[filename, location]. If the sources do not contain the answer, "
               "say 'Not found in the uploaded files.' Do not guess.\n\n" + context)
-    return chat(system, q, max_tokens=1000)
+    return chat(system, q)
 
 
-st.title("AskMyDocs")
+st.title("Chat with your documents")
 st.caption(f"Model: `{MODEL}` (falls back to `openrouter/free` if it fails)")
 
 files = st.file_uploader("Upload PDF, DOCX or TXT files", type=["pdf", "docx", "txt"],
