@@ -1,0 +1,6 @@
+streamlit
+openai
+python-dotenv
+pypdf
+python-docx
+rank-bm25
