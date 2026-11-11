@@ -73,7 +73,7 @@ def answer(q, hits):
     return chat(system, q)
 
 
-st.title("Chat with your documents")
+st.title(Ask My Docs")
 st.caption(f"Model: `{MODEL}` (falls back to `openrouter/free` if it fails)")
 
 files = st.file_uploader("Upload PDF, DOCX or TXT files", type=["pdf", "docx", "txt"],
