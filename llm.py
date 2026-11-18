@@ -1,5 +1,4 @@
 import os
-import time
 
 from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, OpenAI
@@ -28,47 +27,45 @@ def _check_config():
 
 
 def _attempts():
-    """Order of models to try: chosen model, extra fallbacks, then the free router several times."""
+    """Chosen model, extra fallbacks, then the free router several times."""
     order = list(dict.fromkeys([MODEL] + EXTRA))
     order += [ROUTER] * (ROUTER_TRIES - order.count(ROUTER))
     return order
 
 
-def chat(system, user, max_tokens=3000):
-    """Returns (answer_text, model_actually_used). Raises LLMError with a clear message."""
+def stream_chat(prompt, info, max_tokens=3000, temperature=0.2):
+    """Yield the reply text piece by piece. If a model fails before replying, the next one is tried.
+    info["model"] is set to the model that actually answered. Raises LLMError with a clear message."""
     _check_config()
     last_error = "unknown error"
     for model in _attempts():
-        for attempt in range(2):  # one retry on rate limit
-            try:
-                r = client.chat.completions.create(
-                    model=model, max_tokens=max_tokens, temperature=0,
-                    # System text goes inside the user message: some free models reject the system role.
-                    messages=[{"role": "user", "content": f"{system}\n\n---\nQuestion: {user}"}],
-                    # Reasoning ("thinking") models spend output tokens on hidden reasoning first.
-                    # Keep that short so tokens are left for the actual answer, and don't return it.
-                    extra_body={"reasoning": {"effort": "low", "exclude": True}},
-                )
-                choices = getattr(r, "choices", None)
-                used = getattr(r, "model", model)
-                if not choices:
-                    last_error = f"{used} returned no choices"
-                    break
-                text = (choices[0].message.content or "").strip()
-                if text:
-                    return text, used
-                reason = choices[0].finish_reason
-                last_error = (f"{used} used all {max_tokens} tokens on reasoning (finish_reason=length)"
-                              if reason == "length" else f"{used} returned an empty reply ({reason})")
-                break
-            except APIStatusError as e:
-                last_error = f"{model}: HTTP {e.status_code} - {e.message}"
-                if e.status_code == 401:
-                    raise LLMError("Invalid API key (401). Create a new key at openrouter.ai/keys.")
-                if e.status_code == 429 and attempt == 0:
-                    time.sleep(3)
-                    continue
-                break  # 400/404/402/5xx -> try the next model
-            except APIConnectionError:
-                raise LLMError("Can't reach openrouter.ai. Check your internet connection.")
-    raise LLMError(f"All models failed. Last error: {last_error}")
+        got_text = False
+        try:
+            stream = client.chat.completions.create(
+                model=model, max_tokens=max_tokens, temperature=temperature, stream=True,
+                # instructions go in the user message: some free models reject the system role
+                messages=[{"role": "user", "content": prompt}],
+                # keep hidden "thinking" short so tokens are left for the answer
+                extra_body={"reasoning": {"effort": "low", "exclude": True}},
+            )
+            for chunk in stream:
+                if getattr(chunk, "model", None):
+                    info["model"] = chunk.model
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    got_text = True
+                    yield delta
+            if got_text:
+                return
+            last_error = f"{model} returned an empty reply"
+        except APIStatusError as e:
+            if e.status_code == 401:
+                raise LLMError("Invalid API key (401). Create a new key at openrouter.ai/keys.")
+            last_error = f"{model}: HTTP {e.status_code}"
+        except APIConnectionError:
+            raise LLMError("Can't reach openrouter.ai. Check your internet connection.")
+        except Exception as e:  # stream cut off midway
+            if got_text:
+                raise LLMError("The reply was interrupted. Please ask again.")
+            last_error = f"{model}: {e}"
+    raise LLMError(f"All free models are busy right now. Please try again in a minute. ({last_error})")

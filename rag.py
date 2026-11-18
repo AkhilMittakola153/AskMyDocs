@@ -1,114 +1,181 @@
-import re
+"""
+Ask My Docs — chat with your PDF, Word and text files.
+Run:  streamlit run rag.py
+"""
+
+import hashlib
+from datetime import datetime
 
 import streamlit as st
-from docx import Document
-from pypdf import PdfReader
-from rank_bm25 import BM25Okapi
 
-from llm import MODEL, LLMError, chat
+import docs_engine as eng
+from llm import LLMError, stream_chat
 
-CHUNK_WORDS, OVERLAP, TOP_K = 250, 50, 5
+st.set_page_config(page_title="Ask My Docs", page_icon="📚", layout="centered")
 
+st.markdown("""
+<style>
+#MainMenu, footer, [data-testid="stDecoration"] {visibility: hidden;}
+.block-container {padding-top: 2rem; max-width: 820px;}
+.hero {text-align: center; padding: 2.5rem 1rem 1rem;}
+.hero h1 {font-size: 2.3rem; margin-bottom: .2rem;}
+.hero p {opacity: .75; font-size: 1.05rem;}
+.steps {display: flex; gap: .8rem; justify-content: center; flex-wrap: wrap; margin-top: 1.4rem;}
+.step {border: 1px solid rgba(128,128,128,.25); border-radius: 12px; padding: .8rem 1rem; width: 210px; text-align: left;}
+.step b {display: block; margin-bottom: .2rem;}
+.step span {opacity: .7; font-size: .9rem;}
+.src {border-left: 3px solid #e8590c; padding: .3rem .8rem; margin: .5rem 0; font-size: .9rem;}
+.src-title {font-weight: 600; margin-bottom: .2rem;}
+.doc-row {font-size: .88rem; padding: .15rem 0;}
+</style>
+""", unsafe_allow_html=True)
 
-def read_file(f):
-    """Return a list of (filename, page_or_None, text)."""
-    ext = f.name.lower().rsplit(".", 1)[-1]
-    if ext == "pdf":
-        reader = PdfReader(f)
-        return [(f.name, f"p.{i+1}", p.extract_text() or "") for i, p in enumerate(reader.pages)]
-    if ext == "docx":
-        doc = Document(f)
-        lines = [p.text for p in doc.paragraphs]
-        for table in doc.tables:                      # text inside tables was being skipped
-            for row in table.rows:
-                lines.append(" | ".join(c.text for c in row.cells))
-        return [(f.name, None, "\n".join(lines))]
-    return [(f.name, None, f.read().decode("utf-8", errors="ignore"))]
-
-
-def chunk(name, loc, text):
-    words = text.split()
-    step = CHUNK_WORDS - OVERLAP
-    out = []
-    for k, i in enumerate(range(0, max(len(words), 1), step)):
-        piece = " ".join(words[i:i + CHUNK_WORDS])
-        if piece.strip():
-            out.append({"file": name, "loc": loc or f"part {k+1}", "text": piece})
-    return out
+ss = st.session_state
+ss.setdefault("messages", [])
+ss.setdefault("index_sig", None)
 
 
-def tokenize(s):
-    return re.findall(r"\w+", s.lower())
+@st.cache_data(show_spinner=False, max_entries=50)
+def parse(name, data):
+    """Cached by file content, so re-uploading the same file is instant."""
+    return eng.read_file(name, data)
 
 
-def build_index(files):
-    chunks, empty = [], []
-    for f in files:
-        got = 0
-        for name, loc, text in read_file(f):
-            c = chunk(name, loc, text)
-            got += len(c)
-            chunks += c
-        if got == 0:
-            empty.append(f.name)
-    bm25 = BM25Okapi([tokenize(c["text"]) for c in chunks]) if chunks else None
-    return chunks, bm25, empty
+# ---------- Sidebar: documents and settings ----------
+with st.sidebar:
+    st.header("📚 Your documents")
+    files = st.file_uploader("Upload PDF, DOCX, TXT or MD", type=["pdf", "docx", "txt", "md"],
+                             accept_multiple_files=True, label_visibility="collapsed")
+
+    files = files or []
+    too_big = [f.name for f in files if f.size > eng.MAX_FILE_MB * 1024 * 1024]
+    files = [f for f in files if f.name not in too_big]
+    if too_big:
+        st.warning(f"Skipped (over {eng.MAX_FILE_MB} MB): {', '.join(too_big)}")
+
+    # index automatically whenever the set of files changes
+    sig = tuple(sorted((f.name, hashlib.md5(f.getvalue()).hexdigest()) for f in files))
+    if sig != ss.index_sig:
+        if files:
+            with st.spinner("Reading documents..."):
+                parsed, failed = {}, []
+                for f in files:
+                    try:
+                        parsed[f.name] = parse(f.name, f.getvalue())
+                    except Exception:
+                        failed.append(f.name)
+                chunks, bm25, stats = eng.build_index(parsed)
+            ss.update(chunks=chunks, bm25=bm25, stats=stats, failed=failed)
+        else:
+            ss.update(chunks=[], bm25=None, stats={}, failed=[])
+        ss.index_sig = sig
+
+    stats = ss.get("stats", {})
+    if stats:
+        for name, s in stats.items():
+            if s["chunks"] == 0:
+                st.markdown(f"<div class='doc-row'>⚠️ <b>{name}</b> — no text found (scanned PDF?)</div>",
+                            unsafe_allow_html=True)
+            else:
+                size = f"{s['pages']} pages · " if s["pages"] else ""
+                st.markdown(f"<div class='doc-row'>✅ <b>{name}</b><br><span style='opacity:.65'>"
+                            f"{size}{s['words']:,} words</span></div>", unsafe_allow_html=True)
+    for name in ss.get("failed", []):
+        st.error(f"Couldn't read {name}")
+
+    st.divider()
+    with st.expander("⚙️ Settings"):
+        style = st.radio("Answer style", ["Concise", "Detailed"], horizontal=True)
+        top_k = st.slider("Passages used per answer", 3, 10, 5,
+                          help="More passages = more context, but slower and uses more tokens.")
+
+    col1, col2 = st.columns(2)
+    if col1.button("🗑️ Clear chat", disabled=not ss.messages):
+        ss.messages = []
+        st.rerun()
+    if ss.messages:
+        md = "\n\n".join(f"**{'You' if m['role'] == 'user' else 'Ask My Docs'}:** {m['content']}"
+                         for m in ss.messages)
+        col2.download_button("⬇️ Export", md, file_name=f"askmydocs-{datetime.now():%Y%m%d-%H%M}.md")
+
+ready = bool(ss.get("chunks"))
 
 
-def retrieve(q, chunks, bm25):
-    q_tokens = set(tokenize(q))
-    scores = bm25.get_scores(list(q_tokens))
-    ranked = sorted(range(len(chunks)), key=lambda i: scores[i], reverse=True)
-    # Keep chunks sharing at least one word with the question. (Filtering on score > 0 fails for
-    # small files: with only 1-2 chunks BM25's IDF is zero or negative, so every score is <= 0.)
-    hits = [chunks[i] for i in ranked if q_tokens & set(tokenize(chunks[i]["text"]))]
-    return hits[:TOP_K]
+# ---------- Helpers ----------
+def show_sources(sources, question):
+    if not sources:
+        return
+    with st.expander(f"📎 Sources ({len(sources)})"):
+        for s in sources:
+            st.markdown(f"<div class='src'><div class='src-title'>📄 {s['file']} · {s['loc']}</div></div>",
+                        unsafe_allow_html=True)
+            st.markdown(eng.highlight(s["text"], question))
 
 
-def answer(q, hits):
-    context = "\n\n".join(f"[{h['file']}, {h['loc']}]\n{h['text']}" for h in hits)
-    system = ("Answer the question using ONLY the sources below. Cite each fact as "
-              "[filename, location]. If the sources do not contain the answer, "
-              "say 'Not found in the uploaded files.' Do not guess.\n\n" + context)
-    return chat(system, q)
+def answer(question):
+    prev_q = next((m["content"] for m in reversed(ss.messages) if m["role"] == "user"), "")
+    history = list(ss.messages)
+    ss.messages.append({"role": "user", "content": question})
+    with st.chat_message("user", avatar="🧑"):
+        st.markdown(question)
+
+    with st.chat_message("assistant", avatar="📚"):
+        hits = eng.retrieve(question, ss.chunks, ss.bm25, k=top_k, previous_question=prev_q)
+        if not hits:
+            msg = "I couldn't find anything related to that in your documents. Try different keywords."
+            st.markdown(msg)
+            ss.messages.append({"role": "assistant", "content": msg, "sources": []})
+            return
+        info = {}
+        try:
+            text = st.write_stream(stream_chat(eng.build_prompt(question, hits, history, style), info))
+        except LLMError as e:
+            st.error(str(e))
+            ss.messages.pop()  # forget the failed question so it can simply be asked again
+            return
+        model = info.get("model", "")
+        if model:
+            st.caption(f"Answered by {model}")
+        show_sources(hits, question)
+        ss.messages.append({"role": "assistant", "content": text, "sources": hits,
+                            "model": model, "question": question})
 
 
-st.title("Ask My Docs")
-st.caption(f"Model: `{MODEL}` (falls back to `openrouter/free` if it fails)")
+# ---------- Main area ----------
+prompt = st.chat_input("Ask about your documents..." if ready else "Upload a document first",
+                       disabled=not ready)  # always pinned to the bottom of the page
+prompt = prompt or ss.pop("pending", None)
 
-files = st.file_uploader("Upload PDF, DOCX or TXT files", type=["pdf", "docx", "txt"],
-                         accept_multiple_files=True)
-
-if st.button("Index files") and files:
-    chunks, bm25, empty = build_index(files)
-    st.session_state.update(chunks=chunks, bm25=bm25, indexed=sorted(f.name for f in files), answers={})
-    st.success(f"Indexed {len(files)} files into {len(chunks)} chunks.")
-    if empty:
-        st.warning(f"No text found in: {', '.join(empty)} (scanned PDF?)")
-
-if files and st.session_state.get("indexed") and sorted(f.name for f in files) != st.session_state.indexed:
-    st.info("Files changed. Click **Index files** again.")
-
-q = st.text_input("Ask a question")
-if q and st.session_state.get("bm25"):
-    hits = retrieve(q, st.session_state.chunks, st.session_state.bm25)
-    if not hits:
-        st.info("No matching passages. Try different keywords.")
+if not ss.messages and not prompt:
+    st.markdown("""
+    <div class="hero">
+      <h1>📚 Ask My Docs</h1>
+      <p>Chat with your PDFs, Word and text files. Every answer cites the page it came from.</p>
+      <div class="steps">
+        <div class="step"><b>1 · Upload</b><span>Add files in the sidebar. They're read automatically.</span></div>
+        <div class="step"><b>2 · Ask</b><span>Type a question or tap a suggestion below.</span></div>
+        <div class="step"><b>3 · Verify</b><span>Open “Sources” to see the exact passages used.</span></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+    if ready:
+        st.write("")
+        st.markdown("**Try asking:**")
+        cols = st.columns(2)
+        for i, sugg in enumerate(eng.suggested_questions(ss.stats)):
+            if cols[i % 2].button(sugg, key=f"sugg{i}"):
+                ss.pending = sugg.split(" ", 1)[1]  # drop the emoji
+                st.rerun()
     else:
-        cache = st.session_state.setdefault("answers", {})
-        if q not in cache:                            # don't re-call the API on every rerun
-            try:
-                with st.spinner("Thinking..."):
-                    cache[q] = answer(q, hits)
-            except LLMError as e:
-                st.error(str(e))
-        if q in cache:
-            text, used = cache[q]
-            st.write(text)
-            st.caption(f"Answered by: {used}")
-        with st.expander("Sources used"):
-            for h in hits:
-                st.markdown(f"**{h['file']}, {h['loc']}**")
-                st.caption(h["text"][:400] + "...")
-elif q:
-    st.info("Upload files and click **Index files** first.")
+        st.info("⬅️ Upload a document in the sidebar to get started.", icon="📄")
+
+for m in ss.messages:
+    with st.chat_message(m["role"], avatar="🧑" if m["role"] == "user" else "📚"):
+        st.markdown(m["content"])
+        if m.get("model"):
+            st.caption(f"Answered by {m['model']}")
+        if m["role"] == "assistant":
+            show_sources(m.get("sources"), m.get("question", ""))
+
+if prompt and ready:
+    answer(prompt)
